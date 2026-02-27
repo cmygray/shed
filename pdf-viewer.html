@@ -1,0 +1,363 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+  <title>PDF Viewer — shed</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      background: #1a1a1a;
+      color: #eee;
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      height: 100dvh;
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+    }
+
+    #toolbar {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 8px 12px;
+      background: #2a2a2a;
+      border-bottom: 1px solid #3a3a3a;
+      flex-shrink: 0;
+      flex-wrap: wrap;
+    }
+
+    #back {
+      font-size: 13px;
+      color: #888;
+      text-decoration: none;
+      padding: 4px 2px;
+      white-space: nowrap;
+    }
+    #back:hover { color: #ccc; }
+
+    #divider {
+      width: 1px;
+      height: 18px;
+      background: #444;
+      flex-shrink: 0;
+    }
+
+    #toolbar button {
+      padding: 6px 14px;
+      background: #3a3a3a;
+      color: #eee;
+      border: 1px solid #555;
+      border-radius: 6px;
+      cursor: pointer;
+      font-size: 14px;
+      touch-action: manipulation;
+      user-select: none;
+      -webkit-user-select: none;
+    }
+    #toolbar button:active { background: #555; }
+    #toolbar button:disabled { opacity: 0.3; cursor: default; }
+
+    #url-input {
+      flex: 1;
+      min-width: 180px;
+      padding: 6px 10px;
+      background: #333;
+      color: #eee;
+      border: 1px solid #555;
+      border-radius: 6px;
+      font-size: 14px;
+    }
+    #url-input::placeholder { color: #666; }
+
+    #page-info {
+      font-size: 14px;
+      color: #888;
+      white-space: nowrap;
+      min-width: 80px;
+      text-align: center;
+    }
+
+    #canvas-container {
+      flex: 1;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      overflow: hidden;
+      position: relative;
+    }
+
+    #canvas-container canvas {
+      display: block;
+      box-shadow: 0 4px 32px rgba(0, 0, 0, 0.6);
+    }
+
+    #placeholder {
+      color: #555;
+      font-size: 16px;
+      text-align: center;
+      line-height: 2;
+      pointer-events: none;
+    }
+
+    #status {
+      position: absolute;
+      bottom: 20px;
+      left: 50%;
+      transform: translateX(-50%);
+      background: rgba(0, 0, 0, 0.75);
+      color: #fff;
+      padding: 8px 20px;
+      border-radius: 20px;
+      font-size: 14px;
+      display: none;
+      white-space: nowrap;
+      backdrop-filter: blur(4px);
+    }
+
+    #file-input { display: none; }
+  </style>
+</head>
+<body>
+
+<div id="toolbar">
+  <a id="back" href="/">← shed</a>
+  <span id="divider"></span>
+  <button id="open-btn">파일 열기</button>
+  <input type="text" id="url-input" placeholder="PDF URL 입력 후 Enter 또는 불러오기">
+  <button id="load-url-btn">불러오기</button>
+  <span id="page-info">—</span>
+  <button id="prev-btn" disabled>◀</button>
+  <button id="next-btn" disabled>▶</button>
+</div>
+
+<div id="canvas-container">
+  <div id="placeholder">
+    파일을 열거나 URL을 입력하세요<br>
+    <small>← → 키 또는 스와이프로 페이지 이동</small>
+  </div>
+  <div id="status"></div>
+</div>
+
+<input type="file" id="file-input" accept=".pdf,application/pdf">
+
+<script type="module">
+import * as pdfjsLib from 'https://unpkg.com/pdfjs-dist@5.4.624/build/pdf.min.mjs';
+pdfjsLib.GlobalWorkerOptions.workerSrc =
+  'https://unpkg.com/pdfjs-dist@5.4.624/build/pdf.worker.min.mjs';
+
+// ── 디바이스 감지 ─────────────────────────────────────────────────────────────
+
+const IS_IOS = /iPad|iPhone/.test(navigator.userAgent) ||
+  (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+const MAX_CANVAS_PX = IS_IOS ? 3_000_000 : 5_000_000;
+const MAX_DPR = 2;
+
+// ── 소스 추상화: File | URL string → 동일 인터페이스 ─────────────────────────
+
+function resolveSource(input) {
+  if (input instanceof File) {
+    const url = URL.createObjectURL(input);
+    return { url, dispose: () => URL.revokeObjectURL(url) };
+  }
+  // URL string (Content-Disposition: inline 포함)
+  return { url: input, dispose: () => {} };
+}
+
+// ── Fit-page 렌더 파라미터 계산 ──────────────────────────────────────────────
+// 태블릿 화면 기준: 페이지가 container를 꽉 채우는 최대 스케일
+
+function calcRenderInfo(page, container) {
+  const vp1 = page.getViewport({ scale: 1 });
+
+  // CSS 표시 스케일: 너비·높이 중 여백이 생기지 않는 쪽 기준
+  const fitScale = Math.min(
+    container.clientWidth  / vp1.width,
+    container.clientHeight / vp1.height,
+  );
+
+  // 물리 픽셀 렌더 스케일 (DPR 반영, 최대 2x)
+  let renderScale = fitScale * Math.min(window.devicePixelRatio ?? 1, MAX_DPR);
+
+  // 최대 픽셀 수 초과 시 비례 축소 (iOS crash 방어)
+  const testVp = page.getViewport({ scale: renderScale });
+  if (testVp.width * testVp.height > MAX_CANVAS_PX) {
+    renderScale *= Math.sqrt(MAX_CANVAS_PX / (testVp.width * testVp.height));
+  }
+
+  const renderVp = page.getViewport({ scale: renderScale });
+  return {
+    canvasWidth:  Math.floor(renderVp.width),
+    canvasHeight: Math.floor(renderVp.height),
+    cssWidth:     vp1.width  * fitScale,
+    cssHeight:    vp1.height * fitScale,
+    renderVp,
+  };
+}
+
+// ── 뷰어 ─────────────────────────────────────────────────────────────────────
+
+class PDFViewer {
+  #pdf     = null;
+  #source  = null;
+  #current = 1;
+  #cache   = new Map();   // pageNum → canvas (현재 ±1, 최대 3개)
+  #el      = document.getElementById('canvas-container');
+
+  async load(input) {
+    this.destroy();
+    this.#source = resolveSource(input);
+
+    showStatus('로딩 중…');
+    try {
+      this.#pdf = await pdfjsLib.getDocument({ url: this.#source.url }).promise;
+    } catch (e) {
+      showStatus(`불러오기 실패: ${e.message}`);
+      throw e;
+    }
+    showStatus('');
+    await this.#go(1);
+  }
+
+  get total()   { return this.#pdf?.numPages ?? 0; }
+  get current() { return this.#current; }
+
+  async next() { await this.#go(this.#current + 1); }
+  async prev() { await this.#go(this.#current - 1); }
+  async goTo(n) { await this.#go(n); }
+
+  async #go(n) {
+    n = Math.max(1, Math.min(n, this.total));
+    this.#current = n;
+
+    const canvas = await this.#getCanvas(n);
+    this.#mount(canvas);
+    updateUI(this);
+
+    // 인접 페이지 백그라운드 프리로드
+    this.#preload(n - 1);
+    this.#preload(n + 1);
+
+    // 범위 밖 캐시 해제 (현재 ±1만 유지)
+    for (const [num, c] of this.#cache) {
+      if (Math.abs(num - n) > 1) {
+        c.width = 0; c.height = 0;   // GPU 메모리까지 즉시 해제
+        this.#cache.delete(num);
+      }
+    }
+  }
+
+  async #getCanvas(n) {
+    if (this.#cache.has(n)) return this.#cache.get(n);
+
+    const page = await this.#pdf.getPage(n);
+    const info = calcRenderInfo(page, this.#el);
+
+    const canvas = document.createElement('canvas');
+    canvas.width  = info.canvasWidth;
+    canvas.height = info.canvasHeight;
+    canvas.style.cssText =
+      `width:${info.cssWidth}px; height:${info.cssHeight}px`;
+
+    await page.render({
+      canvasContext: canvas.getContext('2d'),
+      viewport: info.renderVp,
+    }).promise;
+
+    page.cleanup();   // PDF.js 내부 캐시 즉시 반환
+    this.#cache.set(n, canvas);
+    return canvas;
+  }
+
+  #preload(n) {
+    if (n < 1 || n > this.total || this.#cache.has(n)) return;
+    requestIdleCallback(() => this.#getCanvas(n), { timeout: 800 });
+  }
+
+  #mount(canvas) {
+    document.getElementById('placeholder').style.display = 'none';
+    this.#el.replaceChildren(canvas, document.getElementById('status'));
+  }
+
+  evictAll() {
+    for (const [, c] of this.#cache) { c.width = 0; c.height = 0; }
+    this.#cache.clear();
+  }
+
+  destroy() {
+    this.evictAll();
+    this.#source?.dispose();
+    this.#pdf?.destroy();
+    this.#pdf = null;
+  }
+}
+
+// ── UI 헬퍼 ──────────────────────────────────────────────────────────────────
+
+function updateUI(viewer) {
+  document.getElementById('page-info').textContent =
+    `${viewer.current} / ${viewer.total}`;
+  document.getElementById('prev-btn').disabled = viewer.current <= 1;
+  document.getElementById('next-btn').disabled = viewer.current >= viewer.total;
+}
+
+function showStatus(msg) {
+  const el = document.getElementById('status');
+  el.textContent = msg;
+  el.style.display = msg ? 'block' : 'none';
+}
+
+// ── 이벤트 연결 ──────────────────────────────────────────────────────────────
+
+const viewer = new PDFViewer();
+
+document.getElementById('open-btn').onclick = () =>
+  document.getElementById('file-input').click();
+
+document.getElementById('file-input').onchange = e => {
+  const file = e.target.files[0];
+  if (file) viewer.load(file).catch(() => {});
+  e.target.value = '';
+};
+
+function loadFromUrl() {
+  const url = document.getElementById('url-input').value.trim();
+  if (url) viewer.load(url).catch(() => {});
+}
+document.getElementById('load-url-btn').onclick = loadFromUrl;
+document.getElementById('url-input').onkeydown = e => {
+  if (e.key === 'Enter') loadFromUrl();
+};
+
+document.getElementById('prev-btn').onclick = () => viewer.prev();
+document.getElementById('next-btn').onclick = () => viewer.next();
+
+document.addEventListener('keydown', e => {
+  if (['ArrowRight', 'ArrowDown', 'PageDown'].includes(e.key)) viewer.next();
+  if (['ArrowLeft',  'ArrowUp',   'PageUp'  ].includes(e.key)) viewer.prev();
+});
+
+const container = document.getElementById('canvas-container');
+let touchStartX = 0;
+container.addEventListener('touchstart', e => {
+  touchStartX = e.touches[0].clientX;
+}, { passive: true });
+container.addEventListener('touchend', e => {
+  const dx = e.changedTouches[0].clientX - touchStartX;
+  if (Math.abs(dx) > 60) dx < 0 ? viewer.next() : viewer.prev();
+}, { passive: true });
+
+new ResizeObserver(() => {
+  if (!viewer.current) return;
+  viewer.evictAll();
+  viewer.goTo(viewer.current);
+}).observe(container);
+
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden) viewer.evictAll();
+});
+</script>
+
+</body>
+</html>
