@@ -1,0 +1,403 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Kanban – shed</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      background: #f5f5f5;
+      color: #222;
+      height: 100dvh;
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+      user-select: none;
+      -webkit-user-select: none;
+    }
+
+    header {
+      padding: 16px 24px;
+      background: #fff;
+      border-bottom: 1px solid #e5e5e5;
+      display: flex;
+      align-items: baseline;
+      gap: 12px;
+      flex-shrink: 0;
+    }
+
+    header h1 { font-size: 18px; font-weight: 700; letter-spacing: -0.3px; }
+    header a { font-size: 13px; color: #999; text-decoration: none; }
+    header a:hover { color: #666; }
+
+    .board {
+      flex: 1;
+      display: flex;
+      gap: 12px;
+      padding: 16px;
+      overflow-x: auto;
+      min-height: 0;
+    }
+
+    .lane {
+      flex: 1;
+      min-width: 260px;
+      max-width: 400px;
+      background: #eee;
+      border-radius: 10px;
+      display: flex;
+      flex-direction: column;
+      min-height: 0;
+    }
+
+    .lane-header {
+      padding: 14px 16px 10px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      flex-shrink: 0;
+    }
+
+    .lane-title {
+      font-size: 13px;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      color: #777;
+    }
+
+    .lane-count {
+      font-size: 12px;
+      color: #aaa;
+      font-weight: 500;
+      min-width: 20px;
+      text-align: center;
+    }
+
+    .lane-body {
+      flex: 1;
+      overflow-y: auto;
+      padding: 0 8px 8px;
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+      min-height: 60px;
+    }
+
+    .lane-body.drag-over {
+      background: rgba(0,0,0,0.03);
+      border-radius: 0 0 10px 10px;
+    }
+
+    .card {
+      background: #fff;
+      border-radius: 8px;
+      padding: 10px 12px;
+      font-size: 14px;
+      line-height: 1.45;
+      box-shadow: 0 1px 2px rgba(0,0,0,0.06);
+      cursor: grab;
+      touch-action: none;
+      position: relative;
+      transition: box-shadow 0.15s, opacity 0.15s;
+      word-break: break-word;
+    }
+
+    .card:hover { box-shadow: 0 2px 6px rgba(0,0,0,0.1); }
+    .card:active { cursor: grabbing; }
+    .card.dragging { opacity: 0.4; }
+
+    .card-ghost {
+      position: fixed;
+      pointer-events: none;
+      z-index: 1000;
+      background: #fff;
+      border-radius: 8px;
+      padding: 10px 12px;
+      font-size: 14px;
+      line-height: 1.45;
+      box-shadow: 0 8px 24px rgba(0,0,0,0.15);
+      transform: rotate(2deg);
+      max-width: 380px;
+      word-break: break-word;
+    }
+
+    .drop-indicator {
+      height: 3px;
+      background: #4a9eff;
+      border-radius: 2px;
+      margin: -1.5px 0;
+      flex-shrink: 0;
+      pointer-events: none;
+    }
+
+    .add-card {
+      background: none;
+      border: none;
+      padding: 8px 12px;
+      font-size: 13px;
+      color: #999;
+      cursor: pointer;
+      text-align: left;
+      border-radius: 6px;
+      flex-shrink: 0;
+      margin: 0 8px 8px;
+    }
+    .add-card:hover { background: rgba(0,0,0,0.04); color: #666; }
+
+    .card-input {
+      background: #fff;
+      border: 2px solid #4a9eff;
+      border-radius: 8px;
+      padding: 8px 10px;
+      font-size: 14px;
+      line-height: 1.45;
+      font-family: inherit;
+      resize: none;
+      outline: none;
+      margin: 0 8px 8px;
+      flex-shrink: 0;
+      width: calc(100% - 16px);
+      field-sizing: content;
+    }
+
+    .lane-body::-webkit-scrollbar { width: 4px; }
+    .lane-body::-webkit-scrollbar-track { background: transparent; }
+    .lane-body::-webkit-scrollbar-thumb { background: #ccc; border-radius: 2px; }
+
+    @media (max-width: 700px) {
+      .board { padding: 8px; gap: 8px; }
+      .lane { min-width: 220px; }
+    }
+  </style>
+</head>
+<body>
+
+<header>
+  <h1>Kanban</h1>
+  <a href="/shed/">shed</a>
+</header>
+
+<div class="board" id="board"></div>
+
+<script>
+const LANES = [
+  { id: 'todo', title: 'To Do', cards: [
+    { id: 'c1', text: 'Design the landing page' },
+    { id: 'c2', text: 'Set up CI/CD pipeline' },
+    { id: 'c3', text: 'Write API documentation' },
+  ]},
+  { id: 'doing', title: 'In Progress', cards: [
+    { id: 'c4', text: 'Implement auth flow' },
+  ]},
+  { id: 'done', title: 'Done', cards: [
+    { id: 'c5', text: 'Project kickoff meeting' },
+  ]},
+];
+
+let cardId = 10;
+let drag = null;
+
+function el(tag, cls, text) {
+  const e = document.createElement(tag);
+  if (cls) e.className = cls;
+  if (text !== undefined) e.textContent = text;
+  return e;
+}
+
+function render() {
+  const board = document.getElementById('board');
+  board.replaceChildren();
+
+  for (const lane of LANES) {
+    const laneEl = el('div', 'lane');
+    laneEl.dataset.lane = lane.id;
+
+    const header = el('div', 'lane-header');
+    header.appendChild(el('span', 'lane-title', lane.title));
+    header.appendChild(el('span', 'lane-count', String(lane.cards.length)));
+    laneEl.appendChild(header);
+
+    const body = el('div', 'lane-body');
+    body.dataset.lane = lane.id;
+    for (const card of lane.cards) {
+      const cardEl = el('div', 'card', card.text);
+      cardEl.dataset.id = card.id;
+      body.appendChild(cardEl);
+    }
+    laneEl.appendChild(body);
+
+    const btn = el('button', 'add-card', '+ Add card');
+    btn.dataset.lane = lane.id;
+    btn.addEventListener('click', () => startAddCard(lane.id));
+    laneEl.appendChild(btn);
+
+    board.appendChild(laneEl);
+  }
+}
+
+function startAddCard(laneId) {
+  const lane = document.querySelector(`.lane[data-lane="${laneId}"]`);
+  const btn = lane.querySelector('.add-card');
+  if (lane.querySelector('.card-input')) return;
+
+  const input = document.createElement('textarea');
+  input.className = 'card-input';
+  input.placeholder = 'Type and press Enter';
+  input.rows = 1;
+  btn.before(input);
+  input.focus();
+  btn.style.display = 'none';
+
+  const commit = () => {
+    const text = input.value.trim();
+    if (text) {
+      const laneData = LANES.find(l => l.id === laneId);
+      laneData.cards.push({ id: 'c' + (++cardId), text });
+    }
+    render();
+  };
+  input.addEventListener('keydown', e => {
+    if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); commit(); }
+    if (e.key === 'Escape') render();
+  });
+  input.addEventListener('blur', commit);
+}
+
+// --- Drag & Drop (pointer events for mouse + touch) ---
+
+function findLaneBodyAt(x, y) {
+  const els = document.elementsFromPoint(x, y);
+  return els.find(e => e.classList.contains('lane-body'));
+}
+
+function getInsertIndex(laneBody, y) {
+  const cards = [...laneBody.querySelectorAll('.card:not(.dragging)')];
+  for (let i = 0; i < cards.length; i++) {
+    const rect = cards[i].getBoundingClientRect();
+    if (y < rect.top + rect.height / 2) return i;
+  }
+  return cards.length;
+}
+
+function removeIndicators() {
+  document.querySelectorAll('.drop-indicator').forEach(e => e.remove());
+  document.querySelectorAll('.drag-over').forEach(e => e.classList.remove('drag-over'));
+}
+
+function showIndicator(laneBody, index) {
+  removeIndicators();
+  laneBody.classList.add('drag-over');
+  const cards = [...laneBody.querySelectorAll('.card:not(.dragging)')];
+  const indicator = el('div', 'drop-indicator');
+  if (index < cards.length) {
+    cards[index].before(indicator);
+  } else {
+    laneBody.appendChild(indicator);
+  }
+}
+
+document.addEventListener('pointerdown', e => {
+  const card = e.target.closest('.card');
+  if (!card) return;
+
+  const rect = card.getBoundingClientRect();
+  drag = {
+    id: card.dataset.id,
+    offsetX: e.clientX - rect.left,
+    offsetY: e.clientY - rect.top,
+    startX: e.clientX,
+    startY: e.clientY,
+    started: false,
+    ghost: null,
+    pointerId: e.pointerId,
+  };
+
+  card.setPointerCapture(e.pointerId);
+  e.preventDefault();
+});
+
+document.addEventListener('pointermove', e => {
+  if (!drag) return;
+
+  const dx = e.clientX - drag.startX;
+  const dy = e.clientY - drag.startY;
+
+  if (!drag.started) {
+    if (Math.abs(dx) < 4 && Math.abs(dy) < 4) return;
+    drag.started = true;
+
+    const card = document.querySelector(`.card[data-id="${drag.id}"]`);
+    card.classList.add('dragging');
+
+    const ghost = el('div', 'card-ghost', card.textContent);
+    ghost.style.width = card.offsetWidth + 'px';
+    document.body.appendChild(ghost);
+    drag.ghost = ghost;
+  }
+
+  drag.ghost.style.left = (e.clientX - drag.offsetX) + 'px';
+  drag.ghost.style.top = (e.clientY - drag.offsetY) + 'px';
+
+  drag.ghost.style.display = 'none';
+  const laneBody = findLaneBodyAt(e.clientX, e.clientY);
+  drag.ghost.style.display = '';
+
+  if (laneBody) {
+    showIndicator(laneBody, getInsertIndex(laneBody, e.clientY));
+  } else {
+    removeIndicators();
+  }
+});
+
+document.addEventListener('pointerup', e => {
+  if (!drag) return;
+
+  if (drag.started) {
+    drag.ghost.style.display = 'none';
+    const laneBody = findLaneBodyAt(e.clientX, e.clientY);
+    drag.ghost.style.display = '';
+
+    if (laneBody) {
+      const targetLaneId = laneBody.dataset.lane;
+      const insertIdx = getInsertIndex(laneBody, e.clientY);
+
+      let cardData;
+      for (const lane of LANES) {
+        const idx = lane.cards.findIndex(c => c.id === drag.id);
+        if (idx !== -1) {
+          cardData = lane.cards.splice(idx, 1)[0];
+          break;
+        }
+      }
+
+      if (cardData) {
+        const targetLane = LANES.find(l => l.id === targetLaneId);
+        targetLane.cards.splice(insertIdx, 0, cardData);
+      }
+    }
+
+    drag.ghost.remove();
+    removeIndicators();
+    render();
+  }
+
+  drag = null;
+});
+
+document.addEventListener('pointercancel', () => {
+  if (drag) {
+    if (drag.ghost) drag.ghost.remove();
+    removeIndicators();
+    render();
+    drag = null;
+  }
+});
+
+render();
+</script>
+</body>
+</html>
