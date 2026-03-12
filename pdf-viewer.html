@@ -57,7 +57,6 @@
       -webkit-user-select: none;
     }
     #toolbar button:active { background: #555; }
-    #toolbar button:disabled { opacity: 0.3; cursor: default; }
 
     #url-input {
       flex: 1;
@@ -79,18 +78,30 @@
       text-align: center;
     }
 
-    #canvas-container {
+    #scroll-container {
       flex: 1;
+      overflow-y: auto;
+      -webkit-overflow-scrolling: touch;
+    }
+
+    #pages {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 12px;
+      padding: 12px 0;
+    }
+
+    .page-slot {
+      background: #222;
       display: flex;
       align-items: center;
       justify-content: center;
-      overflow: hidden;
-      position: relative;
+      flex-shrink: 0;
     }
 
-    #canvas-container canvas {
+    .page-slot canvas {
       display: block;
-      box-shadow: 0 4px 32px rgba(0, 0, 0, 0.6);
     }
 
     #placeholder {
@@ -99,10 +110,11 @@
       text-align: center;
       line-height: 2;
       pointer-events: none;
+      padding-top: 30vh;
     }
 
     #status {
-      position: absolute;
+      position: fixed;
       bottom: 20px;
       left: 50%;
       transform: translateX(-50%);
@@ -114,6 +126,7 @@
       display: none;
       white-space: nowrap;
       backdrop-filter: blur(4px);
+      z-index: 10;
     }
 
     #file-input { display: none; }
@@ -122,24 +135,24 @@
 <body>
 
 <div id="toolbar">
-  <a id="back" href="/shed">← shed</a>
+  <a id="back" href="/shed">&larr; shed</a>
   <span id="divider"></span>
   <button id="open-btn">파일 열기</button>
   <input type="text" id="url-input" placeholder="PDF URL 입력 후 Enter 또는 불러오기">
   <button id="load-url-btn">불러오기</button>
-  <span id="page-info">—</span>
-  <button id="prev-btn" disabled>◀</button>
-  <button id="next-btn" disabled>▶</button>
+  <span id="page-info">&mdash;</span>
 </div>
 
-<div id="canvas-container">
-  <div id="placeholder">
-    파일을 열거나 URL을 입력하세요<br>
-    <small>← → 키 또는 스와이프로 페이지 이동</small>
+<div id="scroll-container">
+  <div id="pages">
+    <div id="placeholder">
+      파일을 열거나 URL을 입력하세요<br>
+      <small>스크롤하여 페이지 이동</small>
+    </div>
   </div>
-  <div id="status"></div>
 </div>
 
+<div id="status"></div>
 <input type="file" id="file-input" accept=".pdf,application/pdf">
 
 <script type="module">
@@ -147,40 +160,24 @@ import * as pdfjsLib from 'https://unpkg.com/pdfjs-dist@5.4.624/build/pdf.min.mj
 pdfjsLib.GlobalWorkerOptions.workerSrc =
   'https://unpkg.com/pdfjs-dist@5.4.624/build/pdf.worker.min.mjs';
 
-// ── 디바이스 감지 ─────────────────────────────────────────────────────────────
-
 const IS_IOS = /iPad|iPhone/.test(navigator.userAgent) ||
   (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
 const MAX_CANVAS_PX = IS_IOS ? 3_000_000 : 5_000_000;
 const MAX_DPR = 2;
-
-// ── 소스 추상화: File | URL string → 동일 인터페이스 ─────────────────────────
 
 function resolveSource(input) {
   if (input instanceof File) {
     const url = URL.createObjectURL(input);
     return { url, dispose: () => URL.revokeObjectURL(url) };
   }
-  // URL string (Content-Disposition: inline 포함)
   return { url: input, dispose: () => {} };
 }
 
-// ── Fit-page 렌더 파라미터 계산 ──────────────────────────────────────────────
-// 태블릿 화면 기준: 페이지가 container를 꽉 채우는 최대 스케일
-
-function calcRenderInfo(page, container) {
+function calcRenderInfo(page, containerWidth) {
   const vp1 = page.getViewport({ scale: 1 });
+  const fitScale = containerWidth / vp1.width;
 
-  // CSS 표시 스케일: 너비·높이 중 여백이 생기지 않는 쪽 기준
-  const fitScale = Math.min(
-    container.clientWidth  / vp1.width,
-    container.clientHeight / vp1.height,
-  );
-
-  // 물리 픽셀 렌더 스케일 (DPR 반영, 최대 2x)
   let renderScale = fitScale * Math.min(window.devicePixelRatio ?? 1, MAX_DPR);
-
-  // 최대 픽셀 수 초과 시 비례 축소 (iOS crash 방어)
   const testVp = page.getViewport({ scale: renderScale });
   if (testVp.width * testVp.height > MAX_CANVAS_PX) {
     renderScale *= Math.sqrt(MAX_CANVAS_PX / (testVp.width * testVp.height));
@@ -198,12 +195,16 @@ function calcRenderInfo(page, container) {
 
 // ── 뷰어 ─────────────────────────────────────────────────────────────────────
 
+const scrollContainer = document.getElementById('scroll-container');
+const pagesEl = document.getElementById('pages');
+const pageInfoEl = document.getElementById('page-info');
+
 class PDFViewer {
-  #pdf     = null;
-  #source  = null;
-  #current = 1;
-  #cache   = new Map();   // pageNum → canvas (현재 ±1, 최대 3개)
-  #el      = document.getElementById('canvas-container');
+  #pdf = null;
+  #source = null;
+  #slots = [];
+  #rendered = new Set();
+  #observer = null;
 
   async load(input) {
     this.destroy();
@@ -217,90 +218,140 @@ class PDFViewer {
       throw e;
     }
     showStatus('');
-    await this.#go(1);
+
+    document.getElementById('placeholder').style.display = 'none';
+    await this.#createSlots();
+    this.#setupObservers();
   }
 
-  get total()   { return this.#pdf?.numPages ?? 0; }
-  get current() { return this.#current; }
+  get total() { return this.#pdf?.numPages ?? 0; }
 
-  async next() { await this.#go(this.#current + 1); }
-  async prev() { await this.#go(this.#current - 1); }
-  async goTo(n) { await this.#go(n); }
+  async #createSlots() {
+    // Clear pages container safely
+    while (pagesEl.firstChild) pagesEl.removeChild(pagesEl.firstChild);
+    this.#slots = [];
+    const containerWidth = scrollContainer.clientWidth - 24;
 
-  async #go(n) {
-    n = Math.max(1, Math.min(n, this.total));
-    this.#current = n;
+    for (let i = 1; i <= this.total; i++) {
+      const page = await this.#pdf.getPage(i);
+      const vp1 = page.getViewport({ scale: 1 });
+      const fitScale = containerWidth / vp1.width;
+      const cssW = vp1.width * fitScale;
+      const cssH = vp1.height * fitScale;
+      page.cleanup();
 
-    const canvas = await this.#getCanvas(n);
-    this.#mount(canvas);
-    updateUI(this);
+      const slot = document.createElement('div');
+      slot.className = 'page-slot';
+      slot.dataset.page = String(i);
+      slot.style.width = `${cssW}px`;
+      slot.style.height = `${cssH}px`;
+      pagesEl.appendChild(slot);
+      this.#slots.push(slot);
+    }
 
-    // 인접 페이지 백그라운드 프리로드
-    this.#preload(n - 1);
-    this.#preload(n + 1);
+    pageInfoEl.textContent = `1 / ${this.total}`;
+  }
 
-    // 범위 밖 캐시 해제 (현재 ±1만 유지)
-    for (const [num, c] of this.#cache) {
-      if (Math.abs(num - n) > 1) {
-        c.width = 0; c.height = 0;   // GPU 메모리까지 즉시 해제
-        this.#cache.delete(num);
+  #setupObservers() {
+    // Render pages when near viewport
+    this.#observer = new IntersectionObserver(
+      entries => {
+        for (const entry of entries) {
+          const pageNum = parseInt(entry.target.dataset.page);
+          if (entry.isIntersecting) {
+            this.#renderPage(pageNum);
+          } else {
+            this.#clearPage(pageNum);
+          }
+        }
+      },
+      { root: scrollContainer, rootMargin: '200% 0px' }
+    );
+
+    for (const slot of this.#slots) {
+      this.#observer.observe(slot);
+    }
+
+    scrollContainer.addEventListener('scroll', this.#onScroll, { passive: true });
+  }
+
+  #onScroll = () => {
+    const containerRect = scrollContainer.getBoundingClientRect();
+    const centerY = containerRect.top + containerRect.height / 2;
+    let currentPage = 1;
+    for (const slot of this.#slots) {
+      const rect = slot.getBoundingClientRect();
+      if (rect.top <= centerY && rect.bottom > centerY) {
+        currentPage = parseInt(slot.dataset.page);
+        break;
+      }
+      if (rect.top <= centerY) {
+        currentPage = parseInt(slot.dataset.page);
       }
     }
-  }
+    pageInfoEl.textContent = `${currentPage} / ${this.total}`;
+  };
 
-  async #getCanvas(n) {
-    if (this.#cache.has(n)) return this.#cache.get(n);
+  async #renderPage(n) {
+    if (this.#rendered.has(n) || !this.#pdf) return;
+    this.#rendered.add(n);
 
+    const slot = this.#slots[n - 1];
     const page = await this.#pdf.getPage(n);
-    const info = calcRenderInfo(page, this.#el);
+    const containerWidth = scrollContainer.clientWidth - 24;
+    const info = calcRenderInfo(page, containerWidth);
 
     const canvas = document.createElement('canvas');
-    canvas.width  = info.canvasWidth;
+    canvas.width = info.canvasWidth;
     canvas.height = info.canvasHeight;
-    canvas.style.cssText =
-      `width:${info.cssWidth}px; height:${info.cssHeight}px`;
+    canvas.style.width = `${info.cssWidth}px`;
+    canvas.style.height = `${info.cssHeight}px`;
 
     await page.render({
       canvasContext: canvas.getContext('2d'),
       viewport: info.renderVp,
     }).promise;
+    page.cleanup();
 
-    page.cleanup();   // PDF.js 내부 캐시 즉시 반환
-    this.#cache.set(n, canvas);
-    return canvas;
+    if (this.#rendered.has(n)) {
+      slot.replaceChildren(canvas);
+    } else {
+      canvas.width = 0;
+      canvas.height = 0;
+    }
   }
 
-  #preload(n) {
-    if (n < 1 || n > this.total || this.#cache.has(n)) return;
-    requestIdleCallback(() => this.#getCanvas(n), { timeout: 800 });
-  }
-
-  #mount(canvas) {
-    document.getElementById('placeholder').style.display = 'none';
-    this.#el.replaceChildren(canvas, document.getElementById('status'));
-  }
-
-  evictAll() {
-    for (const [, c] of this.#cache) { c.width = 0; c.height = 0; }
-    this.#cache.clear();
+  #clearPage(n) {
+    if (!this.#rendered.has(n)) return;
+    this.#rendered.delete(n);
+    const slot = this.#slots[n - 1];
+    const canvas = slot.querySelector('canvas');
+    if (canvas) {
+      canvas.width = 0;
+      canvas.height = 0;
+    }
+    slot.replaceChildren();
   }
 
   destroy() {
-    this.evictAll();
+    scrollContainer.removeEventListener('scroll', this.#onScroll);
+    this.#observer?.disconnect();
+    for (const n of this.#rendered) {
+      const slot = this.#slots[n - 1];
+      const canvas = slot?.querySelector('canvas');
+      if (canvas) { canvas.width = 0; canvas.height = 0; }
+    }
+    this.#rendered.clear();
+    this.#slots = [];
     this.#source?.dispose();
     this.#pdf?.destroy();
     this.#pdf = null;
+    while (pagesEl.firstChild) pagesEl.removeChild(pagesEl.firstChild);
+    pageInfoEl.textContent = '—';
   }
 }
 
 // ── UI 헬퍼 ──────────────────────────────────────────────────────────────────
-
-function updateUI(viewer) {
-  document.getElementById('page-info').textContent =
-    `${viewer.current} / ${viewer.total}`;
-  document.getElementById('prev-btn').disabled = viewer.current <= 1;
-  document.getElementById('next-btn').disabled = viewer.current >= viewer.total;
-}
 
 function showStatus(msg) {
   const el = document.getElementById('status');
@@ -329,34 +380,6 @@ document.getElementById('load-url-btn').onclick = loadFromUrl;
 document.getElementById('url-input').onkeydown = e => {
   if (e.key === 'Enter') loadFromUrl();
 };
-
-document.getElementById('prev-btn').onclick = () => viewer.prev();
-document.getElementById('next-btn').onclick = () => viewer.next();
-
-document.addEventListener('keydown', e => {
-  if (['ArrowRight', 'ArrowDown', 'PageDown'].includes(e.key)) viewer.next();
-  if (['ArrowLeft',  'ArrowUp',   'PageUp'  ].includes(e.key)) viewer.prev();
-});
-
-const container = document.getElementById('canvas-container');
-let touchStartX = 0;
-container.addEventListener('touchstart', e => {
-  touchStartX = e.touches[0].clientX;
-}, { passive: true });
-container.addEventListener('touchend', e => {
-  const dx = e.changedTouches[0].clientX - touchStartX;
-  if (Math.abs(dx) > 60) dx < 0 ? viewer.next() : viewer.prev();
-}, { passive: true });
-
-new ResizeObserver(() => {
-  if (!viewer.current) return;
-  viewer.evictAll();
-  viewer.goTo(viewer.current);
-}).observe(container);
-
-document.addEventListener('visibilitychange', () => {
-  if (document.hidden) viewer.evictAll();
-});
 </script>
 
 </body>
