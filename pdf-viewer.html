@@ -156,7 +156,9 @@
 <input type="file" id="file-input" accept=".pdf,application/pdf">
 
 <script type="module">
+console.log('[pdf-viewer] module start');
 import * as pdfjsLib from 'https://unpkg.com/pdfjs-dist@5.4.624/build/pdf.min.mjs';
+console.log('[pdf-viewer] pdfjs loaded', !!pdfjsLib);
 pdfjsLib.GlobalWorkerOptions.workerSrc =
   'https://unpkg.com/pdfjs-dist@5.4.624/build/pdf.worker.min.mjs';
 
@@ -219,7 +221,8 @@ class PDFViewer {
     }
     showStatus('');
 
-    document.getElementById('placeholder').style.display = 'none';
+    const ph = document.getElementById('placeholder');
+    if (ph) ph.style.display = 'none';
     await this.#createSlots();
     this.#setupObservers();
   }
@@ -368,13 +371,13 @@ document.getElementById('open-btn').onclick = () =>
 
 document.getElementById('file-input').onchange = e => {
   const file = e.target.files[0];
-  if (file) viewer.load(file).catch(() => {});
+  if (file) viewer.load(file).catch(e => console.error('[pdf-viewer] load error', e));
   e.target.value = '';
 };
 
 function loadFromUrl() {
   const url = document.getElementById('url-input').value.trim();
-  if (url) viewer.load(url).catch(() => {});
+  if (url) viewer.load(url).catch(e => console.error('[pdf-viewer] load error', e));
 }
 document.getElementById('load-url-btn').onclick = loadFromUrl;
 document.getElementById('url-input').onkeydown = e => {
